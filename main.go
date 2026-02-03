@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +23,7 @@ func main() {
 	sheetName := os.Getenv("SHEET_NAME")
 	homeRedirect := os.Getenv("HOME_REDIRECT")
 	notFoundRedirect := os.Getenv("NOTFOUND_REDIRECT")
+	redirectStatus := os.Getenv("REDIRECT_STATUS")
 
 	ttlVal := os.Getenv("CACHE_TTL")
 	ttl := time.Second * 5
@@ -33,16 +35,30 @@ func main() {
 		ttl = v
 	}
 
-	srv := &server{
-		db: &cachedURLMap{
-			ttl: ttl,
-			sheet: &sheetsProvider{
-				googleSheetsID: googleSheetsID,
-				sheetName:      sheetName,
-			},
+	urlMap := &cachedURLMap{
+		ttl: ttl,
+		sheet: &sheetsProvider{
+			googleSheetsID: googleSheetsID,
+			sheetName:      sheetName,
 		},
-		homeRedirect: homeRedirect,
+	}
+	if err := urlMap.Init(); err != nil {
+		log.Fatalf("failed to initialize url map: %v", err)
+	}
+
+	srv := &server{
+		db:               urlMap,
+		homeRedirect:     homeRedirect,
 		notFoundRedirect: notFoundRedirect,
+	}
+	if redirectStatus != "" {
+		s, err := strconv.Atoi(redirectStatus)
+		if err != nil {
+			log.Fatalf("failed to parse REDIRECT_STATUS as int: %v", err)
+		}
+		srv.redirectStatus = s
+	} else {
+		srv.redirectStatus = http.StatusMovedPermanently
 	}
 
 	http.HandleFunc("/", srv.handler)
@@ -54,12 +70,19 @@ func main() {
 }
 
 type server struct {
-	db           *cachedURLMap
-	homeRedirect string
+	db               *cachedURLMap
+	homeRedirect     string
 	notFoundRedirect string
+	redirectStatus   int
 }
 
-type URLMap map[string]*url.URL
+type mapData struct {
+	url      *url.URL
+	hitCount int
+	rowIndex int
+}
+
+type URLMap map[string]*mapData
 
 type cachedURLMap struct {
 	sync.RWMutex
@@ -70,7 +93,14 @@ type cachedURLMap struct {
 	sheet *sheetsProvider
 }
 
-func (c *cachedURLMap) Get(query string) (*url.URL, error) {
+func (c *cachedURLMap) Init() error {
+	if err := c.sheet.Init(); err != nil {
+		return fmt.Errorf("failed to initialize sheet: %v", err)
+	}
+	return nil
+}
+
+func (c *cachedURLMap) Get(query string) (*mapData, error) {
 	if err := c.refresh(); err != nil {
 		return nil, err
 	}
@@ -146,11 +176,11 @@ func (s *server) redirect(w http.ResponseWriter, req *http.Request) {
 	}
 
 	log.Printf("redirecting=%q to=%q", req.URL, redirTo.String())
-	http.Redirect(w, req, redirTo.String(), http.StatusFound) // no permanent redirects
+	http.Redirect(w, req, redirTo.String(), s.redirectStatus)
 }
 
 func (s *server) findRedirect(req *url.URL) (*url.URL, error) {
-	path := strings.TrimPrefix(req.Path, "/")
+	path := strings.TrimPrefix(strings.ToLower(req.Path), "/")
 
 	segments := strings.Split(path, "/")
 	var discard []string
@@ -161,7 +191,13 @@ func (s *server) findRedirect(req *url.URL) (*url.URL, error) {
 			return nil, err
 		}
 		if v != nil {
-			return prepRedirect(v, strings.Join(discard, "/"), req.Query()), nil
+			go s.db.sheet.Write("C", v.rowIndex,
+				[]interface{}{
+					strconv.Itoa(v.hitCount + 1),
+					time.Now().Format(time.RFC3339),
+				})
+			v.hitCount++
+			return prepRedirect(v.url, strings.Join(discard, "/"), req.Query()), nil
 		}
 		discard = append([]string{segments[len(segments)-1]}, discard...)
 		segments = segments[:len(segments)-1]
@@ -187,7 +223,7 @@ func prepRedirect(base *url.URL, addPath string, query url.Values) *url.URL {
 
 func urlMap(in [][]interface{}) URLMap {
 	out := make(URLMap)
-	for _, row := range in {
+	for i, row := range in {
 		if len(row) < 2 {
 			continue
 		}
@@ -198,6 +234,18 @@ func urlMap(in [][]interface{}) URLMap {
 		v, ok := row[1].(string)
 		if !ok || v == "" {
 			continue
+		}
+		hitCount := 0
+		if len(row) >= 3 {
+			h, ok := row[2].(string)
+			if !ok || v == "" {
+				continue
+			}
+			hc, err := strconv.Atoi(h)
+			if err != nil {
+				log.Printf("warn: %s=%s hitCount invalid", k, h)
+			}
+			hitCount = hc
 		}
 
 		k = strings.ToLower(k)
@@ -211,7 +259,7 @@ func urlMap(in [][]interface{}) URLMap {
 		if exists {
 			log.Printf("warn: shortcut %q redeclared, overwriting", k)
 		}
-		out[k] = u
+		out[k] = &mapData{u, hitCount, i + 1}
 	}
 	return out
 }
